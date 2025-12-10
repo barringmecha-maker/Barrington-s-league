@@ -1,266 +1,43 @@
- <?php
-// league.php — a simple league table manager (teams, matches, admin login, standings)
+function updateLeagueTable() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const resultsSheet = ss.getSheetByName("Results");
+  const tableSheet = ss.getSheetByName("League Table");
 
-// --- CONFIGURATION ---
-$db_file  = __DIR__ . '/league_db.sqlite';
-$admin_user = 'admin';
-$admin_pass = 'admin123';  // change this password before deployment!
+  const results = resultsSheet.getDataRange().getValues().slice(1); // Skip header
+  const teams = {};
 
-session_start();
+  results.forEach(row => {
+    const [date, home, homeGoals, away, awayGoals] = row;
+    if (!home || !away || homeGoals === "" || awayGoals === "") return;
 
-// --- initialize DB if not exists ---
-if (!file_exists($db_file)) {
-    $db = new SQLite3($db_file);
-    $db->exec("
-      CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        is_admin INTEGER DEFAULT 0
-      );
-    ");
-    $db->exec("
-      CREATE TABLE teams (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE
-      );
-    ");
-    $db->exec("
-      CREATE TABLE matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        home_team INTEGER,
-        away_team INTEGER,
-        score_home INTEGER,
-        score_away INTEGER
-      );
-    ");
-    // create default admin
-    $pw = password_hash($admin_pass, PASSWORD_DEFAULT);
-    $db->exec("INSERT OR IGNORE INTO users(username, password_hash, is_admin) VALUES (
-      '$admin_user', '$pw', 1
-    );");
-} else {
-    $db = new SQLite3($db_file);
-}
+    const hGoals = parseInt(homeGoals, 10);
+    const aGoals = parseInt(awayGoals, 10);
 
-// --- helper functions ---
-function is_admin() {
-    return !empty($_SESSION['is_admin']);
-}
+    if (!teams[home]) teams[home] = { P: 0, W: 0, D: 0, L: 0, GF: 0, GA: 0 };
+    if (!teams[away]) teams[away] = { P: 0, W: 0, D: 0, L: 0, GF: 0, GA: 0 };
 
-function sanitize($s) {
-    return htmlspecialchars(trim($s), ENT_QUOTES);
-}
+    teams[home].P++; teams[away].P++;
+    teams[home].GF += hGoals; teams[home].GA += aGoals;
+    teams[away].GF += aGoals; teams[away].GA += hGoals;
 
-// --- handle POST actions ---
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-    if ($action === 'login') {
-        $u = $_POST['username'] ?? '';
-        $p = $_POST['password'] ?? '';
-        $stmt = $db->prepare('SELECT * FROM users WHERE username = :u LIMIT 1');
-        $stmt->bindValue(':u', $u, SQLITE3_TEXT);
-        $res = $stmt->execute();
-        if ($row = $res->fetchArray(SQLITE3_ASSOC)) {
-            if (password_verify($p, $row['password_hash'])) {
-                $_SESSION['is_admin'] = (bool)$row['is_admin'];
-                header("Location: ".$_SERVER['PHP_SELF']);
-                exit;
-            } else {
-                $error = "Invalid password";
-            }
-        } else {
-            $error = "Invalid username";
-        }
-    }
-    elseif ($action === 'logout') {
-        session_destroy();
-        header("Location: ".$_SERVER['PHP_SELF']);
-        exit;
-    }
-    elseif (is_admin()) {
-        if ($action === 'add_team') {
-            $nm = sanitize($_POST['team_name'] ?? '');
-            if ($nm !== '') {
-                $stmt = $db->prepare("INSERT OR IGNORE INTO teams(name) VALUES (:n)");
-                $stmt->bindValue(':n', $nm, SQLITE3_TEXT);
-                $stmt->execute();
-            }
-        }
-        elseif ($action === 'gen_schedule') {
-            // get all teams
-            $teams = [];
-            $res = $db->query("SELECT id FROM teams");
-            while ($r = $res->fetchArray(SQLITE3_ASSOC)) $teams[] = $r['id'];
-            $db->exec("DELETE FROM matches");
-            $n = count($teams);
-            if ($n % 2 !== 0) $teams[] = null;
-            $N = count($teams);
-            // generate simple round-robin
-            for ($r = 0; $r < $N - 1; $r++) {
-                for ($i = 0; $i < $N/2; $i++) {
-                    $a = $teams[$i];
-                    $b = $teams[$N - 1 - $i];
-                    if ($a !== null && $b !== null) {
-                        $stmt = $db->prepare("INSERT INTO matches(home_team,away_team,score_home,score_away) VALUES (:h,:a,NULL,NULL)");
-                        $stmt->bindValue(':h', $a, SQLITE3_INTEGER);
-                        $stmt->bindValue(':a', $b, SQLITE3_INTEGER);
-                        $stmt->execute();
-                    }
-                }
-                // rotate
-                $last = array_pop($teams);
-                array_splice($teams, 1, 0, [$last]);
-            }
-        }
-        elseif ($action === 'save_result') {
-            $mid = (int)($_POST['match_id'] ?? 0);
-            $sh = (int)($_POST['score_home'] ?? 0);
-            $sa = (int)($_POST['score_away'] ?? 0);
-            $stmt = $db->prepare("UPDATE matches SET score_home=:sh, score_away=:sa WHERE id=:id");
-            $stmt->bindValue(':sh', $sh, SQLITE3_INTEGER);
-            $stmt->bindValue(':sa', $sa, SQLITE3_INTEGER);
-            $stmt->bindValue(':id', $mid, SQLITE3_INTEGER);
-            $stmt->execute();
-        }
-    }
-    header("Location: ".$_SERVER['PHP_SELF']);
-    exit;
-}
-
-// --- load data ---
-$teams = [];
-$resT = $db->query("SELECT id, name FROM teams");
-while ($r = $resT->fetchArray(SQLITE3_ASSOC)) {
-    $teams[$r['id']] = $r['name'];
-}
-$matches = [];
-$resM = $db->query("SELECT * FROM matches ORDER BY id");
-while ($m = $resM->fetchArray(SQLITE3_ASSOC)) {
-    $matches[] = $m;
-}
-
-// compute standings
-$stats = [];
-foreach ($teams as $tid=>$nm) {
-    $stats[$tid] = ['name'=>$nm,'P'=>0,'W'=>0,'D'=>0,'L'=>0,'GF'=>0,'GA'=>0,'Pts'=>0];
-}
-foreach ($matches as $m) {
-    if ($m['score_home'] === null || $m['score_away'] === null) continue;
-    $h = $m['home_team']; $a = $m['away_team'];
-    $sh = (int)$m['score_home']; $sa = (int)$m['score_away'];
-    $stats[$h]['P']++; $stats[$a]['P']++;
-    $stats[$h]['GF'] += $sh; $stats[$h]['GA'] += $sa;
-    $stats[$a]['GF'] += $sa; $stats[$a]['GA'] += $sh;
-    if ($sh > $sa) {
-        $stats[$h]['W']++; $stats[$h]['Pts'] += 3;
-        $stats[$a]['L']++;
-    } elseif ($sa > $sh) {
-        $stats[$a]['W']++; $stats[$a]['Pts'] += 3;
-        $stats[$h]['L']++;
+    if (hGoals > aGoals) {
+      teams[home].W++; teams[away].L++;
+    } else if (hGoals < aGoals) {
+      teams[away].W++; teams[home].L++;
     } else {
-        $stats[$h]['D']++; $stats[$a]['D']++;
-        $stats[$h]['Pts']++; $stats[$a]['Pts']++;
+      teams[home].D++; teams[away].D++;
     }
+  });
+
+  const table = Object.entries(teams).map(([team, stats]) => {
+    const GD = stats.GF - stats.GA;
+    const Pts = stats.W * 3 + stats.D;
+    return [team, stats.P, stats.W, stats.D, stats.L, stats.GF, stats.GA, GD, Pts];
+  });
+
+  table.sort((a, b) => b[8] - a[8] || b[7] - a[7]); // Sort by Points, then GD
+
+  tableSheet.clearContents();
+  tableSheet.appendRow(["Team", "Played", "Won", "Drawn", "Lost", "GF", "GA", "GD", "Points"]);
+  table.forEach(row => tableSheet.appendRow(row));
 }
-
-// sort standings
-$stand = array_values($stats);
-usort($stand, function($a, $b) {
-    if ($b['Pts'] !== $a['Pts']) return $b['Pts'] - $a['Pts'];
-    $gdA = $a['GF'] - $a['GA'];
-    $gdB = $b['GF'] - $b['GA'];
-    if ($gdB !== $gdA) return $gdB - $gdA;
-    return $b['GF'] - $a['GF'];
-});
-?>
-<!DOCTYPE html>
-<html><head>
-  <meta charset="utf-8">
-  <title>League Table</title>
-  <style>
-    body { font-family: sans-serif; padding:20px; }
-    table { border-collapse: collapse; width:100%; margin-bottom:30px; }
-    th, td { border:1px solid #333; padding:5px 8px; text-align:center; }
-    th { background: #ddd; }
-    form { margin:10px 0; }
-  </style>
-</head>
-<body>
-  <h1>League Manager</h1>
-
-  <?php if (!is_admin()): ?>
-    <h2>Admin Login</h2>
-    <?php if (!empty($error)) echo "<p style='color:red;'>".sanitize($error)."</p>"; ?>
-    <form method="post">
-      <input type="hidden" name="action" value="login">
-      <input type="text" name="username" placeholder="Username" required>
-      <input type="password" name="password" placeholder="Password" required>
-      <button type="submit">Login</button>
-    </form>
-  <?php else: ?>
-    <form method="post" style="display:inline-block;">
-      <input type="hidden" name="action" value="logout">
-      <button type="submit">Logout</button>
-    </form>
-
-    <h2>Admin Panel</h2>
-
-    <h3>Add Team</h3>
-    <form method="post">
-      <input type="hidden" name="action" value="add_team">
-      <input type="text" name="team_name" placeholder="Team Name" required>
-      <button type="submit">Add</button>
-    </form>
-
-    <h3>Generate / Reset Schedule (Round‑Robin)</h3>
-    <form method="post">
-      <input type="hidden" name="action" value="gen_schedule">
-      <button type="submit">Generate Schedule</button>
-    </form>
-
-    <h3>Enter Results</h3>
-    <table>
-      <tr><th>ID</th><th>Home</th><th>Away</th><th>Score Home</th><th>Score Away</th><th>Save</th></tr>
-      <?php foreach ($matches as $m): 
-        $hn = $teams[$m['home_team']] ?? '';
-        $an = $teams[$m['away_team']] ?? '';
-      ?>
-        <form method="post">
-        <tr>
-          <td><?= $m['id'] ?></td>
-          <td><?= sanitize($hn) ?></td>
-          <td><?= sanitize($an) ?></td>
-          <td><input type="number" name="score_home" min="0" value="<?= $m['score_home'] ?>"></td>
-          <td><input type="number" name="score_away" min="0" value="<?= $m['score_away'] ?>"></td>
-          <td>
-            <input type="hidden" name="match_id" value="<?= $m['id'] ?>">
-            <button name="action" value="save_result">Save</button>
-          </td>
-        </tr>
-        </form>
-      <?php endforeach; ?>
-    </table>
-  <?php endif; ?>
-
-  <hr>
-
-  <h2>Standings</h2>
-  <table>
-    <tr><th>Pos</th><th>Team</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr>
-    <?php foreach ($stand as $i => $s): ?>
-      <tr>
-        <td><?= $i+1 ?></td>
-        <td><?= sanitize($s['name']) ?></td>
-        <td><?= $s['P'] ?></td>
-        <td><?= $s['W'] ?></td>
-        <td><?= $s['D'] ?></td>
-        <td><?= $s['L'] ?></td>
-        <td><?= $s['GF'] ?></td>
-        <td><?= $s['GA'] ?></td>
-        <td><?= $s['GF'] - $s['GA'] ?></td>
-        <td><?= $s['Pts'] ?></td>
-      </tr>
-    <?php endforeach; ?>
-  </table>
-</body></html>
